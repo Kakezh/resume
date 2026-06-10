@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
 // Avoid Radix Avatar/Checkbox to prevent extra deps; use basic elements
 import {
@@ -14,38 +12,48 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Badge } from '@/components/ui/badge'
-import { Icon } from '@iconify/react'
 import { useToast } from '@/hooks/use-toast'
+import type { ApplicationEntry } from '@/types/application'
 import type { StoredResume } from '@/types/resume'
 import {
   StorageError,
   createEntryFromData,
   deleteResumes,
+  getAllApplications,
   getAllResumes,
   getDefaultResumeData,
   importResumeFile,
   loadDefaultTemplate,
   loadExampleTemplate,
 } from '@/lib/storage'
+import { UserCenterInspectorSheet } from '@/components/user-center-inspector-sheet'
+import { UserCenterTable } from '@/components/user-center-table'
+import { UserCenterToolbar } from '@/components/user-center-toolbar'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
-import ExportButton from '@/components/export-button'
+  formatApplicationDate,
+  formatApplicationStatusSummary,
+  formatInspectorTime,
+  getFamilyId,
+  getPersonalInfoCount,
+  sortApplicationsByUpdatedAt,
+  useUserCenterInspector,
+} from '@/hooks/use-user-center-inspector'
 
 type SortKey = 'name' | 'createdAt' | 'updatedAt'
 type SortDir = 'asc' | 'desc'
+
+interface ResumeFamilyGroup {
+  familyId: string
+  items: StoredResume[]
+}
 
 export default function UserCenter() {
   const navigate = useNavigate()
   const { toast } = useToast()
 
   const [items, setItems] = useState<StoredResume[]>([])
+  const [applications, setApplications] = useState<ApplicationEntry[]>([])
+  const [applicationsAvailable, setApplicationsAvailable] = useState(true)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [keyword, setKeyword] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('updatedAt')
@@ -54,10 +62,34 @@ export default function UserCenter() {
   const [importing, setImporting] = useState(false)
 
   const refresh = useCallback(async () => {
-    try {
-      setItems(await getAllResumes())
-    } catch (e) {
-      toast({ title: '读取失败', description: e instanceof Error ? e.message : '无法读取本地存储' })
+    const [resumesResult, applicationsResult] = await Promise.allSettled([
+      getAllResumes(),
+      getAllApplications(),
+    ])
+
+    if (resumesResult.status === 'fulfilled') {
+      setItems(resumesResult.value)
+    } else {
+      toast({
+        title: '读取失败',
+        description:
+          resumesResult.reason instanceof Error ? resumesResult.reason.message : '无法读取本地存储',
+      })
+    }
+
+    if (applicationsResult.status === 'fulfilled') {
+      setApplications(applicationsResult.value)
+      setApplicationsAvailable(true)
+    } else {
+      setApplications([])
+      setApplicationsAvailable(false)
+      toast({
+        title: '求职记录读取失败',
+        description:
+          applicationsResult.reason instanceof Error
+            ? `${applicationsResult.reason.message}，将暂不显示简历使用情况。`
+            : '将暂不显示简历使用情况。',
+      })
     }
   }, [toast])
 
@@ -99,30 +131,108 @@ export default function UserCenter() {
     return sorted
   }, [items, keyword, sortKey, sortDir])
 
-  const SortArrows = ({ field }: { field: SortKey }) => {
-    const activeAsc = sortKey === field && sortDir === 'asc'
-    const activeDesc = sortKey === field && sortDir === 'desc'
-    return (
-      <span className="ml-1 inline-flex flex-col items-center justify-center rounded border px-0.5 py-px text-[10px] leading-none">
-        <Icon
-          icon="mdi:triangle"
-          className={`h-2.5 w-2.5 cursor-pointer ${activeAsc ? 'text-blue-500' : 'text-muted-foreground/50'}`}
-          onClick={() => {
-            setSortKey(field)
-            setSortDir('asc')
-          }}
-        />
-        <Icon
-          icon="mdi:triangle-down"
-          className={`h-2.5 w-2.5 cursor-pointer ${activeDesc ? 'text-blue-500' : 'text-muted-foreground/50'}`}
-          onClick={() => {
-            setSortKey(field)
-            setSortDir('desc')
-          }}
-        />
-      </span>
-    )
-  }
+  const groupedFamilies = useMemo<ResumeFamilyGroup[]>(() => {
+    const groups = new Map<string, ResumeFamilyGroup>()
+
+    for (const item of filteredSorted) {
+      const familyId = getFamilyId(item)
+      const current = groups.get(familyId)
+
+      if (current) {
+        current.items.push(item)
+      } else {
+        groups.set(familyId, { familyId, items: [item] })
+      }
+    }
+
+    return Array.from(groups.values())
+  }, [filteredSorted])
+
+  const familySizes = useMemo(() => {
+    const sizes = new Map<string, number>()
+
+    for (const item of items) {
+      const familyId = getFamilyId(item)
+      sizes.set(familyId, (sizes.get(familyId) ?? 0) + 1)
+    }
+
+    return sizes
+  }, [items])
+
+  const visibleIds = useMemo(() => filteredSorted.map((item) => item.id), [filteredSorted])
+  const itemMap = useMemo(() => new Map(items.map((item) => [item.id, item])), [items])
+  const applicationMap = useMemo(
+    () => new Map(applications.map((application) => [application.id, application])),
+    [applications],
+  )
+  const applicationsByResumeId = useMemo(() => {
+    const map = new Map<string, ApplicationEntry[]>()
+
+    for (const application of applications) {
+      const resumeId = application.resumeId?.trim()
+      if (!resumeId) {
+        continue
+      }
+
+      const current = map.get(resumeId)
+      if (current) {
+        current.push(application)
+      } else {
+        map.set(resumeId, [application])
+      }
+    }
+
+    for (const [resumeId, linkedApplications] of map.entries()) {
+      map.set(resumeId, sortApplicationsByUpdatedAt(linkedApplications))
+    }
+
+    return map
+  }, [applications])
+  const familyItemsMap = useMemo(() => {
+    const map = new Map<string, StoredResume[]>()
+
+    for (const item of items) {
+      const familyId = getFamilyId(item)
+      const current = map.get(familyId)
+
+      if (current) {
+        current.push(item)
+      } else {
+        map.set(familyId, [item])
+      }
+    }
+
+    for (const familyItems of map.values()) {
+      familyItems.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    }
+
+    return map
+  }, [items])
+  const visibleSelectedIds = useMemo(
+    () => visibleIds.filter((id) => selected.has(id)),
+    [selected, visibleIds],
+  )
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id))
+  const {
+    inspector,
+    inspectorDetailResume,
+    inspectorDetailMetadata,
+    inspectorDetailApplications,
+    inspectorDetailSourceApplication,
+    inspectorDetailLatestApplication,
+    inspectorCompareResumes,
+    inspectorCompareSummary,
+    openDetailInspector,
+    handleCompareWithLatest,
+    handleCompareLatestTwo,
+    closeInspector,
+  } = useUserCenterInspector({
+    itemMap,
+    applicationMap,
+    applicationsByResumeId,
+    familyItemsMap,
+    notify: ({ title, description }) => toast({ title, description }),
+  })
 
   const toggleSelect = (id: string, checked: boolean) => {
     setSelected((prev) => {
@@ -134,8 +244,16 @@ export default function UserCenter() {
   }
 
   const toggleSelectAll = (checked: boolean) => {
-    if (checked) setSelected(new Set(items.map((i) => i.id)))
-    else setSelected(new Set())
+    setSelected((prev) => {
+      const next = new Set(prev)
+
+      for (const id of visibleIds) {
+        if (checked) next.add(id)
+        else next.delete(id)
+      }
+
+      return next
+    })
   }
 
   // 将初始化数据预加载并写入 sessionStorage，然后再跳转，避免在新页面内数据“闪变”
@@ -230,222 +348,59 @@ export default function UserCenter() {
         onChange={handleImport}
       />
 
-      {/* 顶部工具栏 */}
-      <div className="flex items-center justify-between gap-4 p-4">
-        <div className="flex items-center gap-3">
-          <Icon icon="mdi:account" className="text-primary h-6 w-6" />
-          <h1 className="text-lg font-semibold">我的简历</h1>
-          <Badge variant="secondary">{items.length}</Badge>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            variant="outline"
-            className="gap-2 bg-transparent"
-            onClick={() => navigate('/board')}
-          >
-            <Icon icon="mdi:view-kanban-outline" className="h-4 w-4" /> 求职看板
-          </Button>
-          {items.length > 0 && (
-            <>
-              <Input
-                placeholder="搜索简历名称"
-                value={keyword}
-                onChange={(e) => setKeyword(e.target.value)}
-                className="w-56"
-              />
-              {null}
-              <Separator orientation="vertical" className="h-6" />
-              <Button
-                variant="default"
-                className="gap-2"
-                onClick={() => document.getElementById('uc-import-file')?.click()}
-                disabled={importing}
-              >
-                <Icon icon="mdi:import" className="h-4 w-4" /> 导入
-              </Button>
-              <Button onClick={handleCreate} className="gap-2">
-                <Icon icon="mdi:plus" className="h-4 w-4" /> 创建简历
-              </Button>
-              <Button
-                variant="destructive"
-                className="gap-2"
-                disabled={selected.size === 0}
-                onClick={() => setConfirmOpen(true)}
-              >
-                <Icon icon="mdi:trash-can" className="h-4 w-4" /> 批量删除
-              </Button>
-            </>
-          )}
-        </div>
-      </div>
+      <UserCenterToolbar
+        itemsCount={items.length}
+        importing={importing}
+        keyword={keyword}
+        hasItems={items.length > 0}
+        selectedCount={visibleSelectedIds.length}
+        onKeywordChange={setKeyword}
+        onNavigateBoard={() => navigate('/')}
+        onImport={() => document.getElementById('uc-import-file')?.click()}
+        onCreate={handleCreate}
+        onDeleteSelected={() => setConfirmOpen(true)}
+      />
 
       <Separator />
 
-      {/* 列表（表格） */}
-      <div className="space-y-3 p-4">
-        {items.length > 0 && (
-          <div className="flex items-center gap-3 px-2">
-            <input
-              type="checkbox"
-              className="h-4 w-4 rounded border"
-              checked={selected.size > 0 && selected.size === items.length}
-              onChange={(e) => toggleSelectAll(e.target.checked)}
-            />
-            <span className="text-muted-foreground text-sm">已选 {selected.size} 项</span>
-          </div>
-        )}
-        {filteredSorted.length === 0 ? (
-          <div className="py-16">
-            <div className="bg-muted/30 mx-auto max-w-xl rounded-xl border p-10 text-center shadow-sm">
-              <div className="bg-primary/10 mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full">
-                <Icon icon="mdi:file-document-edit" className="text-primary h-8 w-8" />
-              </div>
-              <h3 className="text-xl font-semibold">暂无简历</h3>
-              <div className="mt-2 inline-flex flex-col items-stretch">
-                <p className="text-muted-foreground text-sm">
-                  点击“创建简历”开始，或从 JSON 文件导入已有数据并继续编辑
-                </p>
-                <div className="mt-6 flex items-center justify-between">
-                  <Button onClick={handleCreate} className="shrink-0 gap-2">
-                    <Icon icon="mdi:plus" className="h-4 w-4" /> 创建简历
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="shrink-0 gap-2"
-                    onClick={() => document.getElementById('uc-import-file')?.click()}
-                    disabled={importing}
-                  >
-                    <Icon icon="mdi:import" className="h-4 w-4" /> 导入
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="shrink-0 gap-2"
-                    onClick={() => navigate('/board')}
-                  >
-                    <Icon icon="mdi:view-kanban-outline" className="h-4 w-4" /> 求职看板
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="shrink-0 gap-2"
-                    onClick={() => prefetchAndOpenNew('example')}
-                  >
-                    <Icon icon="mdi:lightbulb-on" className="h-4 w-4" /> 示例
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="shrink-0 gap-2"
-                    onClick={() =>
-                      window.open(
-                        'https://github.com/wzdnzd/resume',
-                        '_blank',
-                        'noopener,noreferrer',
-                      )
-                    }
-                  >
-                    <Icon icon="mdi:github" className="h-4 w-4" /> GitHub
-                  </Button>
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-10"></TableHead>
-                <TableHead className="text-center">编号</TableHead>
-                <TableHead className="text-center">头像</TableHead>
-                <TableHead>
-                  <div className="flex items-center justify-start">
-                    名称 <SortArrows field="name" />
-                  </div>
-                </TableHead>
-                <TableHead className="text-center">
-                  <div className="flex items-center justify-center">
-                    创建时间 <SortArrows field="createdAt" />
-                  </div>
-                </TableHead>
-                <TableHead className="text-center">
-                  <div className="flex items-center justify-center">
-                    更新时间 <SortArrows field="updatedAt" />
-                  </div>
-                </TableHead>
-                <TableHead className="w-[360px] text-center">
-                  <div className="flex items-center justify-center">操作</div>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filteredSorted.map((it) => (
-                <TableRow key={it.id}>
-                  <TableCell>
-                    <input
-                      type="checkbox"
-                      className="h-4 w-4 rounded border"
-                      checked={selected.has(it.id)}
-                      onChange={(e) => toggleSelect(it.id, e.target.checked)}
-                    />
-                  </TableCell>
-                  <TableCell className="text-muted-foreground text-center text-xs">
-                    {it.id.slice(0, 8)}
-                  </TableCell>
-                  <TableCell className="text-center">
-                    <div className="bg-muted mx-auto flex h-10 w-10 items-center justify-center overflow-hidden rounded-full">
-                      <img
-                        src={it.resumeData.avatar || '/not-set.png'}
-                        alt={it.resumeData.title}
-                        className="h-full w-full object-cover"
-                        onError={(ev) => {
-                          ;(ev.currentTarget as HTMLImageElement).src = '/default-avatar.jpg'
-                        }}
-                      />
-                    </div>
-                  </TableCell>
-                  <TableCell className="font-medium">{it.resumeData.title || '未命名'}</TableCell>
-                  <TableCell className="text-center text-xs">
-                    {new Date(it.createdAt).toLocaleString()}
-                  </TableCell>
-                  <TableCell className="text-center text-xs">
-                    {new Date(it.updatedAt).toLocaleString()}
-                  </TableCell>
-                  <TableCell className="w-[360px] text-right">
-                    <div className="flex items-center justify-end gap-2">
-                      <Button
-                        variant="ghost"
-                        className="gap-2"
-                        onClick={() => navigate(`/view/${it.id}`)}
-                      >
-                        <Icon icon="mdi:eye" className="h-4 w-4" /> 查看
-                      </Button>
-                      <ExportButton resumeData={it.resumeData} variant="ghost" />
-                      <Button
-                        variant="ghost"
-                        className="gap-2"
-                        onClick={() => navigate(`/edit/${it.id}`)}
-                      >
-                        <Icon icon="mdi:pencil" className="h-4 w-4" /> 编辑
-                      </Button>
-                      <Button variant="ghost" className="gap-2" onClick={() => handleClone(it.id)}>
-                        <Icon icon="mdi:content-copy" className="h-4 w-4" /> 克隆
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        className="hover:bg-destructive gap-2 hover:text-white"
-                        onClick={() => {
-                          setSelected(new Set([it.id]))
-                          setConfirmOpen(true)
-                        }}
-                      >
-                        <Icon icon="mdi:delete" className="h-4 w-4" /> 删除
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </div>
+      <UserCenterTable
+        itemsCount={items.length}
+        filteredSorted={filteredSorted}
+        groupedFamilies={groupedFamilies}
+        familySizes={familySizes}
+        selected={selected}
+        visibleSelectedIds={visibleSelectedIds}
+        allVisibleSelected={allVisibleSelected}
+        sortKey={sortKey}
+        sortDir={sortDir}
+        applicationsAvailable={applicationsAvailable}
+        applicationsByResumeId={applicationsByResumeId}
+        importing={importing}
+        onToggleSelectAll={toggleSelectAll}
+        onToggleSelect={toggleSelect}
+        onSortChange={(field, dir) => {
+          setSortKey(field)
+          setSortDir(dir)
+        }}
+        onCompareLatestTwo={handleCompareLatestTwo}
+        onEdit={(id) => navigate(`/edit/${id}`)}
+        onView={(id) => navigate(`/view/${id}`)}
+        onOpenDetail={openDetailInspector}
+        onCompareWithLatest={handleCompareWithLatest}
+        onClone={handleClone}
+        onDeleteOne={(id) => {
+          setSelected(new Set([id]))
+          setConfirmOpen(true)
+        }}
+        onCreate={handleCreate}
+        onImport={() => document.getElementById('uc-import-file')?.click()}
+        onNavigateBoard={() => navigate('/')}
+        onOpenExample={() => prefetchAndOpenNew('example')}
+        onOpenGitHub={() =>
+          window.open('https://github.com/wzdnzd/resume', '_blank', 'noopener,noreferrer')
+        }
+        onClearKeyword={() => setKeyword('')}
+      />
 
       {/* 删除确认 */}
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
@@ -460,7 +415,7 @@ export default function UserCenter() {
             <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                handleDelete(Array.from(selected))
+                handleDelete(visibleSelectedIds)
                 setConfirmOpen(false)
               }}
             >
@@ -469,6 +424,24 @@ export default function UserCenter() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <UserCenterInspectorSheet
+        inspector={inspector}
+        applicationsAvailable={applicationsAvailable}
+        inspectorDetailResume={inspectorDetailResume}
+        inspectorDetailMetadata={inspectorDetailMetadata}
+        inspectorDetailApplications={inspectorDetailApplications}
+        inspectorDetailSourceApplication={inspectorDetailSourceApplication}
+        inspectorDetailLatestApplication={inspectorDetailLatestApplication}
+        inspectorCompareResumes={inspectorCompareResumes}
+        inspectorCompareSummary={inspectorCompareSummary}
+        onOpenChange={closeInspector}
+        formatInspectorTime={formatInspectorTime}
+        formatApplicationDate={formatApplicationDate}
+        formatApplicationStatusSummary={formatApplicationStatusSummary}
+        getFamilyId={getFamilyId}
+        getPersonalInfoCount={getPersonalInfoCount}
+      />
     </div>
   )
 }

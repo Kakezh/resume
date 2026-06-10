@@ -9,6 +9,15 @@ export interface ApplicationInput {
   resumeTitle?: string
   url?: string
   appliedAt?: string
+  source?: string
+  contactName?: string
+  contactChannel?: string
+  lastContactAt?: string
+  nextAction?: string
+  interviewStage?: string
+  interviewRound?: string
+  blockedReason?: string
+  result?: string
   notes?: string
 }
 

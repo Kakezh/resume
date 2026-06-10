@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
+import { normalizeResumeDataIcons, normalizeStoredResumeIcons } from '@/lib/icon-storage'
 import type { ApplicationEntry, ApplicationInput } from '@/types/application'
 import type {
+  CreateResumeLineageInput,
   JobIntentionItem,
   JobIntentionSection,
   ModuleContentRow,
@@ -41,7 +43,8 @@ function mapTauriError(e: unknown): StorageError {
 
 export async function getAllResumes(): Promise<StoredResume[]> {
   try {
-    return await invoke<StoredResume[]>('get_all_resumes')
+    const entries = await invoke<StoredResume[]>('get_all_resumes')
+    return await Promise.all(entries.map(normalizeStoredResumeIcons))
   } catch (e) {
     throw mapTauriError(e)
   }
@@ -49,7 +52,8 @@ export async function getAllResumes(): Promise<StoredResume[]> {
 
 export async function getResumeById(id: string): Promise<StoredResume | null> {
   try {
-    return await invoke<StoredResume | null>('get_resume_by_id', { id })
+    const entry = await invoke<StoredResume | null>('get_resume_by_id', { id })
+    return entry ? await normalizeStoredResumeIcons(entry) : null
   } catch (e) {
     throw mapTauriError(e)
   }
@@ -69,7 +73,8 @@ export async function upsertResume(entry: StoredResume): Promise<StoredResume> {
 
 export async function getDefaultResumeData(): Promise<ResumeData> {
   try {
-    return await invoke<ResumeData>('get_default_resume_data')
+    const data = await invoke<ResumeData>('get_default_resume_data')
+    return await normalizeResumeDataIcons(data)
   } catch (e) {
     throw mapTauriError(e)
   }
@@ -85,9 +90,37 @@ export async function validateResumeDataWithBackend(
   }
 }
 
+export async function parseAndValidateResumeDataJson(content: string): Promise<ResumeData> {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(content)
+  } catch {
+    throw new StorageError('简历数据格式错误', 'PARSE_ERROR')
+  }
+
+  try {
+    const validation = await invoke<ResumeValidationResult>('validate_resume_data_command', {
+      data: parsed,
+    })
+
+    if (!validation.isValid) {
+      throw new StorageError(`简历数据校验失败：${validation.errors.join('；')}`, 'PARSE_ERROR')
+    }
+
+    return await normalizeResumeDataIcons(validation.normalizedData)
+  } catch (e) {
+    if (e instanceof StorageError) throw e
+
+    const mapped = mapTauriError(e)
+    throw new StorageError(mapped.message, mapped.code === 'UNKNOWN' ? 'PARSE_ERROR' : mapped.code)
+  }
+}
+
 export async function importResumeFile(content: string): Promise<ResumeData> {
   try {
-    return await invoke<ResumeData>('import_resume_file', { content })
+    const data = await invoke<ResumeData>('import_resume_file', { content })
+    return await normalizeResumeDataIcons(data)
   } catch (e) {
     throw mapTauriError(e)
   }
@@ -95,7 +128,8 @@ export async function importResumeFile(content: string): Promise<ResumeData> {
 
 export async function exportResumeFile(data: ResumeData): Promise<string> {
   try {
-    return await invoke<string>('export_resume_file', { data })
+    const normalizedData = await normalizeResumeDataIcons(data)
+    return await invoke<string>('export_resume_file', { data: normalizedData })
   } catch (e) {
     throw mapTauriError(e)
   }
@@ -155,9 +189,17 @@ export async function deleteResumes(ids: string[]): Promise<void> {
   }
 }
 
-export async function createEntryFromData(data: ResumeData): Promise<StoredResume> {
+export async function createEntryFromData(
+  data: ResumeData,
+  lineage?: CreateResumeLineageInput,
+): Promise<StoredResume> {
   try {
-    return await invoke<StoredResume>('create_resume_from_data', { data })
+    const normalizedData = await normalizeResumeDataIcons(data)
+    const entry = await invoke<StoredResume>('create_resume_from_data', {
+      data: normalizedData,
+      lineage,
+    })
+    return await normalizeStoredResumeIcons(entry)
   } catch (e) {
     throw mapTauriError(e)
   }
@@ -165,12 +207,17 @@ export async function createEntryFromData(data: ResumeData): Promise<StoredResum
 
 export async function updateEntryData(id: string, data: ResumeData): Promise<StoredResume> {
   try {
-    const validation = await validateResumeDataWithBackend(data)
+    const normalizedIconsData = await normalizeResumeDataIcons(data)
+    const validation = await validateResumeDataWithBackend(normalizedIconsData)
     if (!validation.isValid) {
       throw new StorageError(`简历数据校验失败：${validation.errors.join('；')}`)
     }
 
-    return await invoke<StoredResume>('update_resume', { id, data: validation.normalizedData })
+    const entry = await invoke<StoredResume>('update_resume', {
+      id,
+      data: validation.normalizedData,
+    })
+    return await normalizeStoredResumeIcons(entry)
   } catch (e) {
     if (e instanceof StorageError) throw e
     throw mapTauriError(e)
